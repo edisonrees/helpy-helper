@@ -166,7 +166,8 @@ app.get("/api/commands/poll", (req, res) => {
 
   for (const c of pending) {
     if (!c.claims) c.claims = new Map();
-    c.claims.set(deviceId, now);
+    // Only claim once — do not refresh on every poll or commands get stuck unacked.
+    if (!c.claims.has(deviceId)) c.claims.set(deviceId, now);
   }
 
   res.json(echoDevice(req, {
