@@ -97,6 +97,21 @@ app.post("/api/devices/register", (req, res) => {
   res.json(echoDevice(req, { ok: true, device: { ...record, online: true }, hubUrl: process.env.PUBLIC_URL || null }));
 });
 
+app.post("/api/devices/heartbeat", (req, res) => {
+  const { deviceId } = req.body || {};
+  if (!deviceId) return res.status(400).json({ ok: false, error: "deviceId required" });
+
+  const device = devices.get(deviceId);
+  if (!device) return res.status(404).json(echoDevice(req, { ok: false, error: "Device not registered" }));
+
+  if (!validateDeviceHeader(req, deviceId)) {
+    return res.status(403).json(echoDevice(req, { ok: false, error: "X-Ozioscar-Device mismatch" }));
+  }
+
+  device.lastSeen = Date.now();
+  res.json(echoDevice(req, { ok: true, online: true }));
+});
+
 app.get("/api/devices", requireAdmin, (_req, res) => {
   const list = [...devices.values()]
     .map((d) => ({ ...d, online: isOnline(d), lastSeenAgo: Date.now() - d.lastSeen, hasInbox: inbox.has(d.id) }))
