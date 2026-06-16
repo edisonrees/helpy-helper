@@ -3,7 +3,7 @@ const path = require("path");
 const { randomUUID } = require("crypto");
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
 
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.HELPY_API_KEY || "";
@@ -14,8 +14,20 @@ const CLAIM_TIMEOUT_MS = Number(process.env.CLAIM_TIMEOUT_MS || 180000);
 /** @type {Map<string, { id: string, hostname: string, user: string, os: string, version: string, firstSeen: number, lastSeen: number }>} */
 const devices = new Map();
 
-/** @type {Array<{ id: string, target: string, action: string, payload: object, createdAt: number, acks: Map<string, { result: string, at: number }>, claims: Map<string, number> }>} */
+/** @type {Array<{ id: string, target: string, action: string, payload: object, createdAt: number, acks: Map<string, { result: string, at: number, deviceName?: string }>, claims: Map<string, number> }>} */
 const commands = [];
+
+/** @type {Map<string, { commandId: string, action: string, result: string, deviceName: string, at: number }>} */
+const inbox = new Map();
+
+function deviceNameFrom(req) {
+  return req.headers["x-ozioscar-device"] || req.headers["X-Ozioscar-Device"] || null;
+}
+
+function echoDevice(req, body) {
+  const name = deviceNameFrom(req);
+  return name ? { ...body, deviceName: name } : body;
+}
 
 function isOnline(device) {
   return Date.now() - device.lastSeen <= ONLINE_MS;
@@ -29,6 +41,14 @@ function requireAdmin(req, res, next) {
     return res.status(401).json({ ok: false, error: "Unauthorized — set Authorization: Bearer <HELPY_API_KEY>" });
   }
   next();
+}
+
+function validateDeviceHeader(req, deviceId) {
+  const headerName = deviceNameFrom(req);
+  if (!headerName) return true;
+  const device = devices.get(deviceId);
+  if (!device) return false;
+  return device.hostname.toLowerCase() === String(headerName).toLowerCase();
 }
 
 function pruneCommands() {
@@ -57,11 +77,16 @@ app.post("/api/devices/register", (req, res) => {
   const { deviceId, hostname, user, os, version } = req.body || {};
   if (!deviceId) return res.status(400).json({ ok: false, error: "deviceId required" });
 
+  const headerName = deviceNameFrom(req);
+  if (headerName && hostname && headerName.toLowerCase() !== String(hostname).toLowerCase()) {
+    return res.status(403).json(echoDevice(req, { ok: false, error: "X-Ozioscar-Device header must match hostname" }));
+  }
+
   const now = Date.now();
   const existing = devices.get(deviceId);
   const record = {
     id: deviceId,
-    hostname: hostname || "unknown",
+    hostname: hostname || headerName || "unknown",
     user: user || "unknown",
     os: os || "unknown",
     version: version || "unknown",
@@ -69,22 +94,12 @@ app.post("/api/devices/register", (req, res) => {
     lastSeen: now,
   };
   devices.set(deviceId, record);
-  res.json({ ok: true, device: { ...record, online: true }, hubUrl: process.env.PUBLIC_URL || null });
-});
-
-app.post("/api/devices/heartbeat", (req, res) => {
-  const { deviceId } = req.body || {};
-  if (!deviceId || !devices.has(deviceId)) {
-    return res.status(404).json({ ok: false, error: "Device not registered" });
-  }
-  const device = devices.get(deviceId);
-  device.lastSeen = Date.now();
-  res.json({ ok: true, online: true });
+  res.json(echoDevice(req, { ok: true, device: { ...record, online: true }, hubUrl: process.env.PUBLIC_URL || null }));
 });
 
 app.get("/api/devices", requireAdmin, (_req, res) => {
   const list = [...devices.values()]
-    .map((d) => ({ ...d, online: isOnline(d), lastSeenAgo: Date.now() - d.lastSeen }))
+    .map((d) => ({ ...d, online: isOnline(d), lastSeenAgo: Date.now() - d.lastSeen, hasInbox: inbox.has(d.id) }))
     .sort((a, b) => Number(b.online) - Number(a.online) || b.lastSeen - a.lastSeen);
   res.json({ ok: true, onlineThresholdMs: ONLINE_MS, devices: list });
 });
@@ -109,22 +124,23 @@ app.post("/api/commands", requireAdmin, (req, res) => {
   };
   commands.push(cmd);
   pruneCommands();
-  res.json({ ok: true, command: serializeCommand(cmd) });
+  res.json(echoDevice(req, { ok: true, command: serializeCommand(cmd) }));
 });
 
 app.get("/api/commands", requireAdmin, (req, res) => {
   const limit = Math.min(Number(req.query.limit || 50), 200);
-  const list = commands
-    .slice(-limit)
-    .reverse()
-    .map(serializeCommand);
+  const list = commands.slice(-limit).reverse().map(serializeCommand);
   res.json({ ok: true, commands: list });
 });
 
 app.get("/api/commands/poll", (req, res) => {
   const deviceId = req.query.deviceId;
   if (!deviceId || !devices.has(deviceId)) {
-    return res.status(404).json({ ok: false, error: "Device not registered" });
+    return res.status(404).json(echoDevice(req, { ok: false, error: "Device not registered" }));
+  }
+
+  if (!validateDeviceHeader(req, deviceId)) {
+    return res.status(403).json(echoDevice(req, { ok: false, error: "X-Ozioscar-Device mismatch" }));
   }
 
   const device = devices.get(deviceId);
@@ -133,13 +149,12 @@ app.get("/api/commands/poll", (req, res) => {
   const now = Date.now();
   const pending = commands.filter((c) => isPendingForDevice(c, deviceId));
 
-  // Claim immediately so the next poll cannot re-deliver the same command.
   for (const c of pending) {
     if (!c.claims) c.claims = new Map();
     c.claims.set(deviceId, now);
   }
 
-  res.json({
+  res.json(echoDevice(req, {
     ok: true,
     commands: pending.map((c) => ({
       id: c.id,
@@ -147,19 +162,60 @@ app.get("/api/commands/poll", (req, res) => {
       payload: c.payload,
       createdAt: c.createdAt,
     })),
-  });
+  }));
 });
 
 app.post("/api/commands/:id/ack", (req, res) => {
-  const { deviceId, result } = req.body || {};
+  const { deviceId, deviceName, result, action: ackAction } = req.body || {};
   const cmd = commands.find((c) => c.id === req.params.id);
-  if (!cmd) return res.status(404).json({ ok: false, error: "Command not found" });
-  if (!deviceId) return res.status(400).json({ ok: false, error: "deviceId required" });
+  if (!cmd) return res.status(404).json(echoDevice(req, { ok: false, error: "Command not found" }));
+  if (!deviceId) return res.status(400).json(echoDevice(req, { ok: false, error: "deviceId required" }));
 
-  cmd.acks.set(deviceId, { result: result || "ok", at: Date.now() });
+  if (!devices.has(deviceId)) {
+    return res.status(404).json(echoDevice(req, { ok: false, error: "Device not registered" }));
+  }
+
+  if (!validateDeviceHeader(req, deviceId)) {
+    return res.status(403).json(echoDevice(req, { ok: false, error: "X-Ozioscar-Device mismatch" }));
+  }
+
+  const device = devices.get(deviceId);
+  const resolvedName = deviceName || deviceNameFrom(req) || device.hostname;
+  device.lastSeen = Date.now();
+
+  cmd.acks.set(deviceId, { result: result || "ok", at: Date.now(), deviceName: resolvedName });
   cmd.claims?.delete(deviceId);
-  if (devices.has(deviceId)) devices.get(deviceId).lastSeen = Date.now();
-  res.json({ ok: true });
+
+  const action = ackAction || cmd.action;
+  inbox.set(deviceId, {
+    commandId: cmd.id,
+    action,
+    result: result || "ok",
+    deviceName: resolvedName,
+    at: Date.now(),
+  });
+
+  res.json(echoDevice(req, { ok: true, stored: true, action }));
+});
+
+/** One-time read: returns inbox payload once, then deletes it. */
+app.get("/api/inbox/:deviceId", requireAdmin, (req, res) => {
+  const deviceId = req.params.deviceId;
+  const device = devices.get(deviceId);
+  if (!device) return res.status(404).json({ ok: false, error: "Unknown device" });
+
+  const headerName = deviceNameFrom(req);
+  if (headerName && headerName.toLowerCase() !== device.hostname.toLowerCase()) {
+    return res.status(403).json(echoDevice(req, { ok: false, error: "X-Ozioscar-Device must match target device hostname" }));
+  }
+
+  const item = inbox.get(deviceId);
+  if (!item) {
+    return res.json(echoDevice(req, { ok: true, empty: true, deviceName: device.hostname }));
+  }
+
+  inbox.delete(deviceId);
+  res.json(echoDevice(req, { ok: true, consumed: true, deviceName: item.deviceName || device.hostname, ...item }));
 });
 
 function serializeCommand(c) {
