@@ -9,11 +9,12 @@ const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.HELPY_API_KEY || "";
 const ONLINE_MS = Number(process.env.ONLINE_THRESHOLD_MS || 45000);
 const MAX_COMMANDS = 500;
+const CLAIM_TIMEOUT_MS = Number(process.env.CLAIM_TIMEOUT_MS || 180000);
 
 /** @type {Map<string, { id: string, hostname: string, user: string, os: string, version: string, firstSeen: number, lastSeen: number }>} */
 const devices = new Map();
 
-/** @type {Array<{ id: string, target: string, action: string, payload: object, createdAt: number, acks: Map<string, { result: string, at: number }> }>} */
+/** @type {Array<{ id: string, target: string, action: string, payload: object, createdAt: number, acks: Map<string, { result: string, at: number }>, claims: Map<string, number> }>} */
 const commands = [];
 
 function isOnline(device) {
@@ -32,6 +33,20 @@ function requireAdmin(req, res, next) {
 
 function pruneCommands() {
   while (commands.length > MAX_COMMANDS) commands.shift();
+}
+
+function releaseStaleClaims(cmd, now = Date.now()) {
+  if (!cmd.claims) return;
+  for (const [deviceId, claimedAt] of cmd.claims.entries()) {
+    if (now - claimedAt > CLAIM_TIMEOUT_MS) cmd.claims.delete(deviceId);
+  }
+}
+
+function isPendingForDevice(cmd, deviceId) {
+  if (cmd.acks.has(deviceId)) return false;
+  releaseStaleClaims(cmd);
+  if (cmd.claims?.has(deviceId)) return false;
+  return cmd.target === "all" || cmd.target === deviceId;
 }
 
 app.get("/health", (_req, res) => {
@@ -90,6 +105,7 @@ app.post("/api/commands", requireAdmin, (req, res) => {
     payload: payload || {},
     createdAt: Date.now(),
     acks: new Map(),
+    claims: new Map(),
   };
   commands.push(cmd);
   pruneCommands();
@@ -114,10 +130,14 @@ app.get("/api/commands/poll", (req, res) => {
   const device = devices.get(deviceId);
   device.lastSeen = Date.now();
 
-  const pending = commands.filter((c) => {
-    if (c.acks.has(deviceId)) return false;
-    return c.target === "all" || c.target === deviceId;
-  });
+  const now = Date.now();
+  const pending = commands.filter((c) => isPendingForDevice(c, deviceId));
+
+  // Claim immediately so the next poll cannot re-deliver the same command.
+  for (const c of pending) {
+    if (!c.claims) c.claims = new Map();
+    c.claims.set(deviceId, now);
+  }
 
   res.json({
     ok: true,
@@ -137,6 +157,7 @@ app.post("/api/commands/:id/ack", (req, res) => {
   if (!deviceId) return res.status(400).json({ ok: false, error: "deviceId required" });
 
   cmd.acks.set(deviceId, { result: result || "ok", at: Date.now() });
+  cmd.claims?.delete(deviceId);
   if (devices.has(deviceId)) devices.get(deviceId).lastSeen = Date.now();
   res.json({ ok: true });
 });
@@ -149,6 +170,7 @@ function serializeCommand(c) {
     payload: c.payload,
     createdAt: c.createdAt,
     acks: Object.fromEntries(c.acks),
+    claims: c.claims ? Object.fromEntries(c.claims) : {},
   };
 }
 
